@@ -1,0 +1,5 @@
+[workspace]
+resolver = "1"
+members = [    
+    "game_tree", "cfr"
+, "csv_tool", "plot"]

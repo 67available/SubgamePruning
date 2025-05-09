@@ -1,0 +1,15 @@
+[package]
+name = "cfr"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rayon = "1.10.0"
+serde = {version = "1.0.210", features = ["derive"]}
+regex = "1.10.5"
+game_tree = { path = "../game_tree"}
+csv_tool = { path = "../csv_tool"}
+plot = { path = "../plot"}
+plotters = "0.3.7"
+tqdm = "0.7.0"
+clap = "4.5.37"
