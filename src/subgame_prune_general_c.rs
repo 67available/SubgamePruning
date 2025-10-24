@@ -1,0 +1,637 @@
+use indicatif::{ProgressBar, ProgressStyle};
+
+use crate::{
+    DELTA_RP, JUMPTHEGUN, WARMUP,
+    br::{self, argmax},
+    cfr::{Policy, StaticTree, UtilityTree, build_policy, build_utiltiy_tree},
+    dfs::{PruneVisitor, dfs_with_pruning_backprop},
+    load_tree::{History, InfoSet, PubNode, from_json},
+    logger::Logger,
+    timer::CfrTimerWithSamples,
+};
+use core::f64;
+use std::{
+    collections::{BTreeMap, HashMap},
+    time::Instant,
+};
+
+/// 存储用与剪枝判定与RM补偿相关的信息，
+struct PruneInfo {
+    zero_regret: Vec<bool>,
+    zero_regret_c: Vec<usize>,
+    under_prune_root_only: Vec<bool>, // 只将alpha根节点的under_prune置为true，对于子节点仍然置为false
+    under_check_free_prune_root_only: Vec<bool>, // 同上，只记录alpha根节点
+    have_update_alpha2h_rp: Vec<bool>, // 同上，只记录alpha根节点
+    duration: Vec<usize>,             // 在alpha根节点记录被裁剪了多少次迭代
+}
+
+struct DynamicCtx {
+    pub cfg: crate::Config,
+    pub step: usize,
+    pub policy_vec: Vec<Policy>,
+    pub utility_tree: UtilityTree,
+    pub prune_info: PruneInfo,
+}
+
+impl DynamicCtx {
+    pub fn get_root_value(&self, player: usize) -> f64 {
+        self.utility_tree.get_utility_p(player, 0)
+    }
+}
+
+#[derive(Clone)]
+struct SubgamePruneVal {
+    max_regret: f64,
+    constraint_broken: bool,
+    num_not_pruned_node: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CompensateVal {
+    update_alpha2h_rp: bool, // check_free恰终止时的那次迭代置为true
+    root_of_pruned_subgame: usize,
+    compensate: bool,
+}
+
+struct SubgamePrune;
+/// subgame prune general
+impl PruneVisitor<DynamicCtx, StaticTree, SubgamePruneVal, CompensateVal> for SubgamePrune {
+    fn on_enter(
+        &mut self,
+        idx: usize,
+        depth: usize,
+        signal: &Option<CompensateVal>,
+        ctx: &mut DynamicCtx,
+        static_ctx: &StaticTree,
+    ) -> (crate::dfs::DfsAction, Option<CompensateVal>) {
+        // dbg!("on_enter", idx);
+        let num_player = ctx.policy_vec.len();
+        let pubnode = &static_ctx.pubtree[idx];
+        // 如果singal不为None，说明这个节点是某个正在被裁剪的子博弈的非根节点。否则代表该节点没有被裁剪或者为被裁减子博弈的根节点。
+        let (under_prune_and_no_root, mut update_alpha2h_rp) = if let Some(sig) = signal.as_ref() {
+            (true, sig.update_alpha2h_rp)
+        } else {
+            (false, false)
+        };
+        // 1. （对于被裁剪子博弈的根节点）判断节点是否为满足开始裁剪条件（这里采用了更严格的zero_regret条件来判断是否启动prune）
+        if ctx.prune_info.zero_regret[idx]
+            && ctx.prune_info.zero_regret_c[idx] > JUMPTHEGUN
+            && !under_prune_and_no_root
+            && !ctx.prune_info.under_prune_root_only[idx]
+        {
+            ctx.prune_info.under_prune_root_only[idx] = true;
+            ctx.prune_info.under_check_free_prune_root_only[idx] = true;
+        }
+        // 1. （对于被裁剪子博弈的根节点）判断节点是否为满足check-free条件 a. 上一次更新max_regret时，max_regret -> 0 b. 当前rp与上一次更新时的rp一致
+        if ctx.prune_info.under_prune_root_only[idx] {
+            // 若当前节点为被裁减子博弈的根节点
+            // 1.1 检查当前rp与上一次更新时的rp是否一致 / 接近
+            let infosets = &pubnode.infosets;
+            let mut rp_diff = 0.0;
+            for (p, infosets_p) in infosets.iter().enumerate() {
+                let tmp_infoset_dict = &static_ctx.infoset_dict[p];
+                for infoset_str in infosets_p {
+                    let history_idx = tmp_infoset_dict[infoset_str].i2history[0];
+                    rp_diff += ctx.utility_tree.get_self_rp_diffence(p, history_idx);
+                }
+            }
+
+            let histories = &pubnode.histories;
+            // 1.2 对当前节点内所有的历史做rp累积
+            for &history_idx in histories {
+                ctx.utility_tree.accum_rp(history_idx);
+            }
+            // 1.3 记录当次裁剪持续的时间
+            ctx.prune_info.duration[idx] += 1;
+            // 1.4 判断是否满足check-free条件
+            if rp_diff <= DELTA_RP && !ctx.cfg.force_compensate {
+                // 1.4.1 如果满足则直接退出
+                return (crate::dfs::DfsAction::PruneSubtree, None); // 该节点不用入栈
+            } else {
+                // 1.4.2 如果不满足则需要对子博弈内的每个信息集进行check
+                ctx.prune_info.under_check_free_prune_root_only[idx] = false;
+                // 1.4.3 如果之前没有更新过alpha2h则仅在本次迭代进行更新
+                if ctx.prune_info.have_update_alpha2h_rp[idx] == false {
+                    ctx.prune_info.have_update_alpha2h_rp[idx] = true;
+                    update_alpha2h_rp = true; // 对于check-free-end当次迭代需要更新alpha2h等信息
+                }
+                // compensate = true;     // 在general版本中，compensate只在on_exit里触发
+            }
+        }
+        // 2. 更新子节点的last_rp，由于在更新子节点rp时会直接把last_rp覆盖掉，所以如果子节点被裁剪的话，需要提前把子节点的last_rp存储起来。另一种实现方式是我每次更新rp的时候都存一下last_rp，如果被裁剪则不更新last_rp。
+        // 选择第二种实现方式，这部分代码挪到3. 中
+        // 3. 更新子节点的rp
+        if pubnode.node_type == "P" {
+            let current_player = static_ctx.get_current_player(idx) as usize;
+            let infosets = &pubnode.infosets[current_player];
+            let strategy_i = infosets
+                .iter()
+                .map(|x| ctx.policy_vec[current_player].get_strategy(x))
+                .collect::<Vec<_>>();
+            for (infoset_str, strategy) in infosets.iter().zip(strategy_i.iter()) {
+                static_ctx.infoset_dict[current_player][infoset_str]
+                    .i2history
+                    .iter()
+                    .for_each(|&history_idx| {
+                        let children = &static_ctx.game_state_tree[history_idx].children;
+                        ctx.utility_tree
+                            .update_rp(history_idx, children, strategy, current_player);
+                        //  ------ subgame_prune  -------//
+                        if !ctx.prune_info.under_prune_root_only[idx] {
+                            ctx.utility_tree.update_last_rp(history_idx);
+                        }
+                        if update_alpha2h_rp {
+                            ctx.utility_tree.update_all(
+                                history_idx,
+                                &children,
+                                strategy,
+                                current_player,
+                                num_player,
+                                !under_prune_and_no_root,
+                            );
+                        }
+                    });
+            }
+        } else if pubnode.node_type == "C" {
+            let histories = &pubnode.histories;
+            for &history_idx in histories {
+                let strategy = static_ctx.game_state_tree[history_idx]
+                    .chance
+                    .as_ref()
+                    .unwrap();
+                let children = &static_ctx.game_state_tree[history_idx].children;
+                ctx.utility_tree
+                    .update_rp(history_idx, children, strategy, num_player);
+                //  ------ subgame_prune  -------//
+                if !ctx.prune_info.under_prune_root_only[idx] {
+                    ctx.utility_tree.update_last_rp(history_idx);
+                }
+                ctx.utility_tree.update_last_rp(history_idx);
+                if update_alpha2h_rp {
+                    ctx.utility_tree.update_all(
+                        history_idx,
+                        &children,
+                        strategy,
+                        num_player,
+                        num_player,
+                        !under_prune_and_no_root,
+                    );
+                }
+            }
+        } else if pubnode.node_type == "T" {
+        } else {
+            panic!("Unknown Node Type")
+        }
+        let val_down;
+        if ctx.prune_info.under_prune_root_only[idx] {
+            val_down = Some(CompensateVal {
+                root_of_pruned_subgame: idx,
+                update_alpha2h_rp,
+                compensate: false,
+            });
+        } else {
+            val_down = signal.clone();
+        }
+        (
+            crate::dfs::DfsAction::Continue(pubnode.children.clone()),
+            val_down,
+        )
+    }
+
+    fn on_leaf(
+        &mut self,
+        idx: usize,
+        depth: usize,
+        ctx: &mut DynamicCtx,
+        static_ctx: &StaticTree,
+    ) -> SubgamePruneVal {
+        // 更新utility
+        let pubnode = &static_ctx.pubtree[idx];
+        for &history_idx in pubnode.histories.iter() {
+            ctx.utility_tree.update_leaf_utility(
+                history_idx,
+                &static_ctx.game_state_tree[history_idx]
+                    .payoff
+                    .as_ref()
+                    .unwrap(),
+            );
+        }
+        SubgamePruneVal {
+            max_regret: 0.0,
+            constraint_broken: false,
+            num_not_pruned_node: 1,
+        }
+    }
+
+    fn on_pruned(
+        &mut self,
+        idx: usize,
+        depth: usize,
+        ctx: &mut DynamicCtx,
+        static_ctx: &StaticTree,
+    ) -> SubgamePruneVal {
+        SubgamePruneVal {
+            max_regret: 99.0,
+            constraint_broken: false,
+            num_not_pruned_node: 0,
+        }
+    }
+
+    fn on_accumulate(
+        &mut self,
+        parent_idx: usize,
+        child_idx: usize,
+        child_val: SubgamePruneVal,
+        agg: &mut Option<SubgamePruneVal>,
+        depth: usize,
+        ctx: &mut DynamicCtx,
+        static_ctx: &StaticTree,
+    ) -> std::ops::ControlFlow<SubgamePruneVal, ()> {
+        match agg {
+            Some(v) => {
+                v.max_regret = v.max_regret.max(child_val.max_regret);
+                v.constraint_broken = v.constraint_broken || child_val.constraint_broken;
+                v.num_not_pruned_node += child_val.num_not_pruned_node;
+                if v.constraint_broken {
+                    return std::ops::ControlFlow::Break(agg.clone().unwrap()); // 中止遍历，直接回退到被裁减子博弈的根节点
+                }
+            }
+            None => *agg = Some(child_val),
+        }
+
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn on_exit(
+        &mut self,
+        idx: usize,
+        agg: Option<SubgamePruneVal>,
+        signal: Option<CompensateVal>,
+        depth: usize,
+        ctx: &mut DynamicCtx,
+        static_ctx: &StaticTree,
+    ) -> (crate::dfs::DFSExitAction<CompensateVal>, SubgamePruneVal) {
+        // dbg!("on_exit", idx);
+        // max_reget
+        let (mut max_regret, mut constraint_broken) = if let Some(v) = agg.as_ref() {
+            (v.max_regret, v.constraint_broken)
+        } else {
+            (0.0, false)
+        };
+        let pubnode = &static_ctx.pubtree[idx];
+        let (under_prune, compensate) = if let Some(sig) = signal.as_ref() {
+            (true, sig.compensate)
+        } else {
+            (false, false)
+        }; // 如果singal不为None，则这个节点正在被裁剪
+        if compensate || !under_prune {
+            if pubnode.node_type == "P" {
+                let current_player = static_ctx.get_current_player(idx) as usize;
+                let infosets = &pubnode.infosets[current_player];
+                let strategy_i = infosets
+                    .iter()
+                    .map(|x| ctx.policy_vec[current_player].get_strategy(x))
+                    .collect::<Vec<_>>();
+                // 1. 更新当前节点的utiltiy
+                // prune期间不需要更新utility
+                if !under_prune {
+                    for (infoset_str, strategy) in infosets.iter().zip(strategy_i.iter()) {
+                        static_ctx.infoset_dict[current_player][infoset_str]
+                            .i2history
+                            .iter()
+                            .for_each(|&history_idx| {
+                                let children = &static_ctx.game_state_tree[history_idx].children;
+                                ctx.utility_tree
+                                    .update_utility(history_idx, children, strategy)
+                            });
+                    }
+                }
+                for (infoset_str, strategy) in infosets.iter().zip(strategy_i.iter()) {
+                    // 2. 更新平均策略
+                    let self_rp = if compensate {
+                        // RM补偿
+                        ctx.utility_tree.get_self_rp_compensate(
+                            current_player,
+                            static_ctx.infoset_dict[current_player][infoset_str].i2history[0],
+                        )
+                    } else {
+                        ctx.utility_tree.get_self_rp(
+                            current_player,
+                            static_ctx.infoset_dict[current_player][infoset_str].i2history[0],
+                        )
+                    };
+                    // under_prune且非compensate不需要更新平均策略
+                    let weight: f64;
+                    if ctx.cfg.cfr_plus {
+                        weight = if under_prune {
+                            let root_of_prune_subgame =
+                                signal.as_ref().unwrap().root_of_pruned_subgame;
+                            let ti = ((ctx.step + 1)
+                                + (ctx.step - ctx.prune_info.duration[root_of_prune_subgame] + 2)) as f64
+                                // * ctx.prune_info.duration[root_of_prune_subgame]
+                                / 2.0;
+                            ti * self_rp // 这里计算的并不是精确的weight而是一个近似，如果想要精确计算weight，需要在累加rp的时候就对每个step独立加权
+                        } else {
+                            (ctx.step + 1) as f64 * self_rp
+                        };
+                    } else {
+                        weight = self_rp;
+                    }
+                    ctx.policy_vec[current_player].update_avg_strategy(infoset_str, weight);
+                    // 3. 计算当前信息集的cv_ia和cv
+                    let n_actions = strategy.len();
+                    let init = vec![0.0f64; n_actions];
+                    let (cv_ia, cv) = static_ctx.infoset_dict[current_player][infoset_str]
+                        .i2history
+                        .iter()
+                        .map(|&history_idx| {
+                            // RM补偿，此处可以直接修改cv_ia为累积cv_ia，但是要注意不能直接用这个累积cv_ia计算max_regret，max_regret需要用当前regret计算，对于cfr_plus而言这里不需要做补偿，所以对于cfr而言我们其实也可以不补偿，这样在经验上可能会有比cfr更快的收敛效果，但是如果要保持与cfr的一致性的话还是得补偿。
+                            let rp_outside = if compensate {
+                                ctx.utility_tree
+                                    .get_rp_outside_compensate(current_player, history_idx)
+                            } else {
+                                ctx.utility_tree.get_rp_outside(current_player, history_idx)
+                            };
+                            let cv_ia = static_ctx.game_state_tree[history_idx]
+                                .children
+                                .iter()
+                                .map(|&child_history_idx| {
+                                    ctx.utility_tree
+                                        .get_utility_p(current_player, child_history_idx)
+                                        * rp_outside
+                                })
+                                .collect::<Vec<_>>();
+                            let cv = rp_outside
+                                * ctx.utility_tree.get_utility_p(current_player, history_idx);
+                            (cv_ia, cv)
+                        })
+                        .fold((init, 0.0), |(mut accum_cv_ia, accum_cv), (cv_ia, cv)| {
+                            accum_cv_ia
+                                .iter_mut()
+                                .zip(cv_ia.iter())
+                                .for_each(|(x, y)| *x += y);
+                            (accum_cv_ia, accum_cv + cv)
+                        });
+                    // 4.1 计算当前信息集的瞬时遗憾，更新Policy
+                    let regret = cv_ia.into_iter().map(|x| x - cv).collect::<Vec<_>>();
+                    ctx.policy_vec[current_player].update_regret(
+                        infoset_str,
+                        &regret,
+                        ctx.cfg.cfr_plus,
+                    );
+                    // 4.2 计算最大遗憾值，用与PruneConstraint判定
+                    // 如果前头做了RM补偿，则regret为累积regret而不是当前的regret，当前的regret还得重新算，一种方式是认为当一个子博弈刚被补偿后它不可能马上又被裁剪，所以我直接将max_regret设为一个足够大的数
+                    if compensate {
+                        max_regret = 99.0
+                    } else {
+                        let max_regret_idx = argmax(&regret).unwrap();
+                        if regret[max_regret_idx] > max_regret {
+                            max_regret = regret[max_regret_idx]
+                        }
+                    }
+                    // 5. 更新当前策略
+                    ctx.policy_vec[current_player].update_current_strategy(infoset_str);
+                }
+            } else if pubnode.node_type == "C" {
+                // 1. 更新当前节点的utiltiy
+                let histories = &pubnode.histories;
+                for &history_idx in histories {
+                    let strategy = static_ctx.game_state_tree[history_idx]
+                        .chance
+                        .as_ref()
+                        .unwrap();
+                    let children = &static_ctx.game_state_tree[history_idx].children;
+                    ctx.utility_tree
+                        .update_utility(history_idx, children, strategy)
+                }
+            } else if pubnode.node_type == "T" {
+            } else {
+                panic!("Unknown Node Type")
+            }
+            // 如果此时max_regret == 0 ， 说明以这个节点为根节点的子博弈是可以裁剪的
+            if max_regret <= crate::DELTA_REGRET {
+                ctx.prune_info.zero_regret[idx] = true;
+                ctx.prune_info.zero_regret_c[idx] += 1;
+            } else {
+                ctx.prune_info.zero_regret[idx] = false;
+                ctx.prune_info.zero_regret_c[idx] = 0;
+            }
+            if compensate && signal.unwrap().root_of_pruned_subgame == idx {
+                // dbg!("clean accum rp ", idx);
+                // 如果进行了补偿且该节点时被裁剪博弈的根节点，则需要清空accum_rp
+                pubnode
+                    .histories
+                    .iter()
+                    .for_each(|&x| ctx.utility_tree.reset(x)); // 清空accum_rp
+                ctx.prune_info.duration[idx] = 0;
+                ctx.prune_info.have_update_alpha2h_rp[idx] = false;
+                ctx.prune_info.under_prune_root_only[idx] = false;
+                ctx.prune_info.under_check_free_prune_root_only[idx] = false;
+            }
+            (
+                crate::dfs::DFSExitAction::Exit,
+                SubgamePruneVal {
+                    max_regret,
+                    constraint_broken: false,
+                    num_not_pruned_node: if compensate {
+                        // 是否计入compensate阶段遍历的节点，计入会比较公平一点，因为compensate的计算量与正常cfr迭代相当，不能忽略
+                        1 + agg.as_ref().unwrap().num_not_pruned_node // 0
+                    } else {
+                        1 + agg.as_ref().unwrap().num_not_pruned_node
+                    },
+                },
+            )
+        } else {
+            // under prune且非check-free，需要做prune constraint检查
+            // dbg!("check-prune_constraint", idx);
+            if pubnode.node_type == "P" && constraint_broken == false {
+                let current_player = static_ctx.get_current_player(idx) as usize;
+                let infosets = &pubnode.infosets[current_player];
+                let strategy_i = infosets
+                    .iter()
+                    .map(|x| ctx.policy_vec[current_player].get_strategy(x))
+                    .collect::<Vec<_>>();
+                let mut constraint_broken_local = false;
+                for (infoset_str, strategy) in infosets.iter().zip(strategy_i.iter()) {
+                    // 1. 计算当前信息集的累积cv_ia和cv
+                    let n_actions = strategy.len();
+                    let init = vec![0.0f64; n_actions];
+                    let (cv_ia, cv) = static_ctx.infoset_dict[current_player][infoset_str]
+                        .i2history
+                        .iter()
+                        .map(|&history_idx| {
+                            // RM补偿，此处可以直接修改cv_ia为累积cv_ia，但是要注意不能直接用这个累积cv_ia计算max_regret，max_regret需要用当前regret计算，对于cfr_plus而言这里不需要做补偿，所以对于cfr而言我们其实也可以不补偿，这样在经验上可能会有比cfr更快的收敛效果，但是如果要保持与cfr的一致性的话还是得补偿。
+                            let rp_outside = ctx
+                                .utility_tree
+                                .get_rp_outside_compensate(current_player, history_idx);
+                            let cv_ia = static_ctx.game_state_tree[history_idx]
+                                .children
+                                .iter()
+                                .map(|&child_history_idx| {
+                                    ctx.utility_tree
+                                        .get_utility_p(current_player, child_history_idx)
+                                        * rp_outside
+                                })
+                                .collect::<Vec<_>>();
+                            let cv = rp_outside
+                                * ctx.utility_tree.get_utility_p(current_player, history_idx);
+                            (cv_ia, cv)
+                        })
+                        .fold((init, 0.0), |(mut accum_cv_ia, accum_cv), (cv_ia, cv)| {
+                            accum_cv_ia
+                                .iter_mut()
+                                .zip(cv_ia.iter())
+                                .for_each(|(x, y)| *x += y);
+                            (accum_cv_ia, accum_cv + cv)
+                        });
+                    // 2. 计算当前信息集的瞬时遗憾，检验是否满足prune constrait
+                    let regret = cv_ia.into_iter().map(|x| x - cv).collect::<Vec<_>>();
+                    // under prune阶段把max_regret置为1.0避免嵌套裁剪
+                    max_regret = 99.0;
+                    if !ctx.policy_vec[current_player].check_regret(infoset_str, &regret) {
+                        constraint_broken_local = true;
+                        break; // 只要有一个信息集违反条件
+                    }
+                }
+                constraint_broken = constraint_broken || constraint_broken_local;
+            }
+            let mut signal = signal.unwrap();
+            if (constraint_broken || ctx.cfg.force_compensate)
+                && signal.root_of_pruned_subgame == idx
+            {
+                signal.compensate = true;
+                (
+                    crate::dfs::DFSExitAction::Restart::<CompensateVal>(signal),
+                    SubgamePruneVal {
+                        max_regret,
+                        constraint_broken,
+                        num_not_pruned_node: 0,
+                    },
+                )
+            } else {
+                (
+                    crate::dfs::DFSExitAction::Exit,
+                    SubgamePruneVal {
+                        max_regret,
+                        constraint_broken,
+                        num_not_pruned_node: 0,
+                    },
+                )
+            }
+        }
+    }
+}
+
+pub fn subgame_prune_cfr(game_name: &str, mut logger: Logger, cfg: crate::Config) {
+    println!("loading {}", game_name);
+    let static_trees: (
+        Vec<PubNode>,
+        Vec<Vec<InfoSet>>,
+        Vec<HashMap<String, InfoSet>>,
+        Vec<History>,
+    ) = from_json(&format!("tree/{}/trees_{}_0923.txt", game_name, game_name));
+    let policy_vec = build_policy(&static_trees);
+    let utility_tree = build_utiltiy_tree(&static_trees);
+    let mut utility_tree4br = build_utiltiy_tree(&static_trees); // 计算exploit用的utility_tree，避免计算exploit时把subgame prune里需要存储的信息覆盖了
+    let prune_info = PruneInfo {
+        under_prune_root_only: vec![false; static_trees.3.len()],
+        zero_regret: vec![false; static_trees.3.len()],
+        zero_regret_c: vec![0; static_trees.3.len()],
+        under_check_free_prune_root_only: vec![false; static_trees.3.len()],
+        duration: vec![0; static_trees.3.len()],
+        have_update_alpha2h_rp: vec![false; static_trees.3.len()],
+    };
+    let mut ctx = DynamicCtx {
+        step: 0,
+        cfg,
+        policy_vec,
+        utility_tree,
+        prune_info,
+    };
+    let static_ctx = StaticTree {
+        pubtree: static_trees.0,
+        infoset_dict: static_trees.2,
+        game_state_tree: static_trees.3,
+    };
+    let num_player = static_ctx.infoset_dict.len();
+    let mut timer = CfrTimerWithSamples::new(50_000, 42); // 最多保留5万样本
+    let bar = ProgressBar::new(ctx.cfg.epoch.try_into().unwrap());
+    bar.set_style(
+        ProgressStyle::with_template(
+            // {eta} 就是预计完成时间；{elapsed} 已耗时；{per_sec} 速度
+            "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} \
+             ({percent}%) • {per_sec} it/s • ETA {eta}",
+        )
+        .unwrap()
+        .progress_chars("##-"),
+    );
+    let mut num_not_pruned_node = 0;
+    for step in 0..ctx.cfg.epoch {
+        bar.inc(1);
+        if ctx.cfg.record_step.contains(&step) {
+            ctx.cfg.force_compensate = true;
+        } else {
+            ctx.cfg.force_compensate = false;
+        }
+        let mut m = BTreeMap::new();
+        let t0 = Instant::now();
+        let val = dfs_with_pruning_backprop(0, &mut ctx, &static_ctx, &mut SubgamePrune {});
+        let dt = t0.elapsed();
+        if step > WARMUP {
+            timer.add(dt, 1);
+        }
+        ctx.step += 1;
+        num_not_pruned_node += val.as_ref().unwrap().num_not_pruned_node;
+        if ctx.cfg.record_step.contains(&step) {
+            for player in 0..num_player {
+                m.insert(
+                    format!("current_return_{}", player),
+                    ctx.get_root_value(player),
+                );
+            }
+
+            let mut ctx = br::DynamicCtx {
+                br_player: 99, // 设为99是为了计算二者在平均策略下的收益
+                policy_vec: &ctx.policy_vec,
+                utility_tree: &mut utility_tree4br,
+            };
+            dfs_with_pruning_backprop(0, &mut ctx, &static_ctx, &mut br::BestResponse {});
+            let avg_value = (0..num_player)
+                .into_iter()
+                .map(|x| ctx.get_root_value(x))
+                .collect::<Vec<_>>();
+            let mut best_reponse_value = vec![];
+            for br_player in 0..num_player {
+                ctx.br_player = br_player;
+                dfs_with_pruning_backprop(0, &mut ctx, &static_ctx, &mut br::BestResponse {});
+                best_reponse_value.push(ctx.get_root_value(br_player));
+            }
+
+            let exploit = best_reponse_value
+                .iter()
+                .zip(avg_value.iter())
+                .map(|(x, y)| x - y)
+                .sum::<f64>()
+                / num_player as f64;
+
+            m.insert("exploit".to_string(), exploit);
+            for p in 0..num_player {
+                m.insert(format!("avg_return_{}", p), avg_value[p]);
+            }
+            for p in 0..num_player {
+                m.insert(format!("br_return_{}", p), best_reponse_value[p]);
+            }
+            m.insert(
+                "num_not_pruned_node".to_string(),
+                num_not_pruned_node as f64,
+            );
+            m.insert(
+                "max_regret".to_string(),
+                val.as_ref().unwrap().max_regret as f64,
+            );
+            m.insert("avg_time(ms)".to_string(), timer.average_ms());
+            logger.log_step(step, &m).unwrap();
+            num_not_pruned_node = 0;
+        }
+    }
+}
