@@ -5,16 +5,16 @@
 
 # 你的实验命令列表（6 个）
 $experiments = @(
-    @{Title="Exp1_CFR";   Cmd='cargo run "cfr/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo cfr -- --release'},
-    @{Title="Exp3";  Cmd='cargo run "cfr-sp-check-free-only/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo sp -- --release'},
-    @{Title="Exp5"; Cmd='cargo run "cfr-sp-general/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo sp-general -- --release'},
-    @{Title="Exp7";  Cmd='cargo run "cfr-sp-check-free-only_c/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo spc -- --release'},
-    @{Title="Exp9"; Cmd='cargo run "cfr-sp-general_c/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo sp-general-c -- --release'}
-    # @{Title="Exp2_CFR+";  Cmd='cargo run "cfr-plus/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo cfr --cfr-plus -- --release'},
-    # @{Title="Exp4"; Cmd='cargo run "cfr-plus-sp-check-free-only/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo sp --cfr-plus -- --release'},
-    # @{Title="Exp6";  Cmd='cargo run "cfr-plus-sp-general/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo sp-general --cfr-plus -- --release'},
-    # @{Title="Exp8"; Cmd='cargo run "cfr-plus-sp-check-free-only_c/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo spc --cfr-plus -- --release'},
-    # @{Title="Exp10";  Cmd='cargo run "cfr-plus-sp-general_c/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo sp-general-c --cfr-plus -- --release'}
+    @{Title="Exp1_CFR";   Cmd='cargo run "cfr/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo cfr'},
+    @{Title="Exp3";  Cmd='cargo run "cfr-sp-check-free-only/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo sp'},
+    @{Title="Exp5"; Cmd='cargo run "cfr-sp-general/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo sp-general'},
+    @{Title="Exp7";  Cmd='cargo run "cfr-sp-check-free-only_c/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo spc'},
+    @{Title="Exp9"; Cmd='cargo run "cfr-sp-general_c/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo sp-general-c'}
+    # @{Title="Exp2_CFR+";  Cmd='cargo run "cfr-plus/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo cfr --cfr-plus'},
+    # @{Title="Exp4"; Cmd='cargo run "cfr-plus-sp-check-free-only/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo sp --cfr-plus'},
+    # @{Title="Exp6";  Cmd='cargo run "cfr-plus-sp-general/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo sp-general --cfr-plus'},
+    # @{Title="Exp8"; Cmd='cargo run "cfr-plus-sp-check-free-only_c/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo spc --cfr-plus'},
+    # @{Title="Exp10";  Cmd='cargo run "cfr-plus-sp-general_c/liars_dice" "测时实验" --env liars_dice --epoch 100000 --algo sp-general-c --cfr-plus'}
 )
 
 # 每个进程绑定一个核心注意这里的编号是逻辑核心编号

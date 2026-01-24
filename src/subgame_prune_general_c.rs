@@ -86,13 +86,15 @@ impl PruneVisitor<DynamicCtx, StaticTree, SubgamePruneVal, CompensateVal> for Su
         if ctx.prune_info.under_prune_root_only[idx] {
             // 若当前节点为被裁减子博弈的根节点
             // 1.1 检查当前rp与上一次更新时的rp是否一致 / 接近
-            let infosets = &pubnode.infosets;
             let mut rp_diff = 0.0;
-            for (p, infosets_p) in infosets.iter().enumerate() {
-                let tmp_infoset_dict = &static_ctx.infoset_dict[p];
-                for infoset_str in infosets_p {
-                    let history_idx = tmp_infoset_dict[infoset_str].i2history[0];
-                    rp_diff += ctx.utility_tree.get_self_rp_diffence(p, history_idx);
+            if !ctx.cfg.force_compensate {
+                let infosets = &pubnode.infosets;
+                for (p, infosets_p) in infosets.iter().enumerate() {
+                    let tmp_infoset_dict = &static_ctx.infoset_dict[p];
+                    for infoset_str in infosets_p {
+                        let history_idx = tmp_infoset_dict[infoset_str].i2history[0];
+                        rp_diff += ctx.utility_tree.get_self_rp_diffence(p, history_idx);
+                    }
                 }
             }
 
@@ -530,7 +532,7 @@ pub fn subgame_prune_cfr(game_name: &str, mut logger: Logger, cfg: crate::Config
         Vec<HashMap<String, InfoSet>>,
         Vec<History>,
     ) = from_json(&format!("tree/{}/trees_{}_0923.txt", game_name, game_name));
-    let policy_vec = build_policy(&static_trees);
+    let policy_vec = build_policy(&static_trees, &cfg);
     let utility_tree = build_utiltiy_tree(&static_trees);
     let mut utility_tree4br = build_utiltiy_tree(&static_trees); // 计算exploit用的utility_tree，避免计算exploit时把subgame prune里需要存储的信息覆盖了
     let prune_info = PruneInfo {
@@ -566,23 +568,32 @@ pub fn subgame_prune_cfr(game_name: &str, mut logger: Logger, cfg: crate::Config
         .progress_chars("##-"),
     );
     let mut num_not_pruned_node = 0;
+    let mut t0 = Instant::now();
+    let mut start_step = 0;
     for step in 0..ctx.cfg.epoch {
-        bar.inc(1);
         if ctx.cfg.record_step.contains(&step) {
             ctx.cfg.force_compensate = true;
         } else {
             ctx.cfg.force_compensate = false;
         }
         let mut m = BTreeMap::new();
-        let t0 = Instant::now();
         let val = dfs_with_pruning_backprop(0, &mut ctx, &static_ctx, &mut SubgamePrune {});
-        let dt = t0.elapsed();
-        if step > WARMUP {
-            timer.add(dt, 1);
-        }
         ctx.step += 1;
         num_not_pruned_node += val.as_ref().unwrap().num_not_pruned_node;
+        bar.inc(1);
         if ctx.cfg.record_step.contains(&step) {
+            let message = format!(
+                "Step {} | ETA: {:?} | Progress: {}/{}",
+                step + 1,
+                crate::timer::format_duration(bar.eta()),
+                step + 1,
+                ctx.cfg.epoch
+            );
+            println!("{}", message);
+            if step > WARMUP {
+                let dt = t0.elapsed();
+                timer.add(dt, (step - start_step) as u64);
+            }
             for player in 0..num_player {
                 m.insert(
                     format!("current_return_{}", player),
@@ -632,6 +643,8 @@ pub fn subgame_prune_cfr(game_name: &str, mut logger: Logger, cfg: crate::Config
             m.insert("avg_time(ms)".to_string(), timer.average_ms());
             logger.log_step(step, &m).unwrap();
             num_not_pruned_node = 0;
+            t0 = Instant::now();
+            start_step = step;
         }
     }
 }

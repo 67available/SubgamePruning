@@ -8,6 +8,8 @@ mod subgame_prune_check_free_only_c;
 mod subgame_prune_general;
 mod subgame_prune_general_c;
 mod timer;
+use std::fmt;
+
 use clap::{Parser, ValueEnum};
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -48,6 +50,9 @@ struct Args {
     /// env
     #[arg(long, default_value = "kuhn_poker")]
     env: String,
+
+    #[arg(long, default_value_t = false)]
+    rand_init: bool,
 }
 
 /// cfg
@@ -59,20 +64,26 @@ struct Config {
     force_compensate: bool,  // 用于dbg或者计算exploit，强制进行compensate
     record_step: Vec<usize>, // 需要输出信息的step
     delta: [f64; 2],
+    rand_init: bool,
 }
 
-impl ToString for Config {
-    fn to_string(&self) -> String {
-        format!(
-            "algo:{:?}\ncfr+:{}\ndelta:{:?}\nepoch:{}\n",
-            self.algo, self.cfr_plus, self.delta, self.epoch
+impl fmt::Display for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "algo={:?}\n\
+             cfr_plus={}\n\
+             epoch={}\n\
+             force_compensate={}\n\
+             delta={:?}\n\
+             rand_init={}",
+            self.algo, self.cfr_plus, self.epoch, self.force_compensate, self.delta, self.rand_init,
         )
     }
 }
-
 const DELTA_RP: f64 = 1e-15;
 const DELTA_REGRET: f64 = 1e-15;
-const WARMUP: usize = 50; // 前50代用于热身
+const WARMUP: usize = 500; // 前500代用于热身
 const JUMPTHEGUN: usize = 2;
 
 fn record_step(epoch: usize) -> Vec<usize> {
@@ -97,7 +108,7 @@ fn record_step(epoch: usize) -> Vec<usize> {
 fn main() {
     // 支持：cargo run -- <exp_name> <purpose...> --cfr-plus --algo cfr --epoch 500
     // cargo run "kuhn/vanilla_cfr" "测试代码输出一致性" --env kuhn_poker --epoch 1000
-    // cargo run "kuhn/cfr_w_sp_check-free-only" "测试代码输出一致性" --env kuhn_poker --epoch 1000 --algo sp -- --release
+    // cargo run "kuhn/cfr_w_sp_check-free-only" "测试代码输出一致性" --env kuhn_poker --epoch 1000 --algo sp
     let args = Args::parse();
 
     let exp_name = args.exp_name.unwrap_or_else(|| "default_exp".into());
@@ -114,6 +125,7 @@ fn main() {
         force_compensate: false,
         record_step: record_step(args.epoch),
         delta: [DELTA_RP, DELTA_REGRET],
+        rand_init: args.rand_init,
     };
 
     let logger = logger::Logger::new(
@@ -150,6 +162,7 @@ fn test_subgame_prune() {
         force_compensate: false, // 在计算exploit需要把force_compensate置为true
         record_step: record_step(1000),
         delta: [DELTA_RP, DELTA_REGRET],
+        rand_init: false,
     };
 
     let logger = logger::Logger::new(
@@ -180,6 +193,7 @@ fn test_subgame_prune_general() {
         force_compensate: false, // 在计算exploit需要把force_compensate置为true
         record_step: record_step(1000),
         delta: [DELTA_RP, DELTA_REGRET],
+        rand_init: false,
     };
 
     let logger = logger::Logger::new(

@@ -1,11 +1,12 @@
 use crate::{
-    br,
+    WARMUP, br,
     dfs::{PruneVisitor, dfs_with_pruning_backprop},
     load_tree::{History, InfoSet, PubNode, from_json},
     logger::Logger,
-    timer::CfrTimerWithSamples,
+    timer::{CfrTimerWithSamples, format_duration},
 };
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::Rng;
 use rayon::prelude::*;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -26,7 +27,23 @@ struct RegretMatchingCell {
 }
 
 impl RegretMatchingCell {
-    fn new(num_action: usize) -> Self {
+    fn new(num_action: usize, rand_init: bool) -> Self {
+        if rand_init {
+            let mut rng = rand::rng();
+            // sample from Dirichlet(1,...,1)
+            let mut strategy: Vec<f64> = (0..num_action).map(|_| rng.random::<f64>()).collect();
+            let sum: f64 = strategy.iter().sum();
+            for x in strategy.iter_mut() {
+                *x /= sum;
+            }
+            return RegretMatchingCell {
+                strategy: strategy.clone(),
+                avg_strategy: strategy, // 初始时 avg_strategy = strategy
+                accu_regret: vec![0.0; num_action],
+                avg_weight: 0.0,
+                ins_regret: vec![0.0; num_action],
+            };
+        }
         RegretMatchingCell {
             strategy: vec![1.0 / num_action as f64; num_action],
             avg_strategy: vec![1.0 / num_action as f64; num_action],
@@ -113,6 +130,7 @@ pub fn build_policy(
         Vec<HashMap<String, InfoSet>>,
         Vec<History>,
     ),
+    cfg: &crate::Config,
 ) -> Vec<Policy> {
     let num_player = static_trees.1.len();
     let mut policy_vec = vec![];
@@ -124,7 +142,10 @@ pub fn build_policy(
                 (static_trees.3[x.i2history[0]].current_player == p as i32).then(|| {
                     (
                         Arc::new(x.key.clone()),
-                        RegretMatchingCell::new(x.children.len()),
+                        RegretMatchingCell::new(
+                            static_trees.3[x.i2history[0]].children.len(),
+                            cfg.rand_init,
+                        ),
                     )
                 })
             })
@@ -259,17 +280,27 @@ impl UtilityTree {
             .unwrap();
         let rp_alpha2 = self.inner[idx].rp_alpha2h_on_prune.as_ref().unwrap();
         // dbg!(rp_2alpha, rp_alpha2);
-        rp_alpha2
-            .iter()
-            .zip(rp_2alpha.iter())
-            .enumerate()
-            .fold(1.0, |product, (player, rp)| {
-                if player != current_player {
-                    product * rp.0 * rp.1
-                } else {
-                    product
-                }
-            })
+        // rp_alpha2
+        //     .iter()
+        //     .zip(rp_2alpha.iter())
+        //     .enumerate()
+        //     .fold(1.0, |product, (player, rp)| {
+        //         if player != current_player {
+        //             product * rp.0 * rp.1
+        //         } else {
+        //             product
+        //         }
+        //     })
+        let mut product = 1.0;
+        // [0, current_player)
+        for i in 0..current_player {
+            product *= rp_alpha2[i] * rp_2alpha[i];
+        }
+        // (current_player, end)
+        for i in current_player + 1..rp_alpha2.len() {
+            product *= rp_alpha2[i] * rp_2alpha[i];
+        }
+        product
     }
 
     /// 在rp已经被更新过的情况下，更新accum_rp，注意更新accum_rp时不需要累加Chance玩家的rp
@@ -277,15 +308,9 @@ impl UtilityTree {
         let utitliy_node = &mut self.inner[idx];
         let num_player = utitliy_node.rp.len() - 1;
         if let Some(accum_rp) = &mut utitliy_node.accum_rp {
-            accum_rp
-                .iter_mut()
-                .zip(utitliy_node.rp.iter())
-                .enumerate()
-                .for_each(|(p, (x, y))| {
-                    if p != num_player {
-                        *x += y
-                    }
-                });
+            for p in 0..num_player {
+                accum_rp[p] += utitliy_node.rp[p];
+            }
         } else {
             utitliy_node.accum_rp = Some(utitliy_node.rp.clone());
         }
@@ -878,7 +903,7 @@ pub fn cfr(game_name: &str, mut logger: Logger, cfg: crate::Config) {
         Vec<HashMap<String, InfoSet>>,
         Vec<History>,
     ) = from_json(&format!("tree/{}/trees_{}_0923.txt", game_name, game_name));
-    let policy_vec = build_policy(&static_trees);
+    let policy_vec = build_policy(&static_trees, &cfg);
     let utility_tree = build_utiltiy_tree(&static_trees);
     let mut ctx = DynamicCtx {
         step: 0,
@@ -906,13 +931,13 @@ pub fn cfr(game_name: &str, mut logger: Logger, cfg: crate::Config) {
     let mut num_not_pruned_node = 0;
     let mut pp_prune = [0, 0];
     let mut total_num_game_states = 0;
+    let mut t0 = Instant::now();
+    let mut start_step = 0;
     for step in 0..ctx.cfg.epoch {
         // if let Err(e) = record_policy_to_csv(&mut ctx, step, "policy_log.csv") {
         //     eprintln!("Failed to record policy at step {}: {:?}", step, e);
         // }
-        bar.inc(1);
         let mut m = BTreeMap::new();
-        let t0 = Instant::now();
         let pp = dfs_with_pruning_backprop::<DynamicCtx, StaticTree, ParitalPruneVal, CfrVal, Cfr>(
             0,
             &mut ctx,
@@ -926,11 +951,22 @@ pub fn cfr(game_name: &str, mut logger: Logger, cfg: crate::Config) {
                 .for_each(|(x, y)| *x += y);
             total_num_game_states += pp.total_states;
         }
-        let dt = t0.elapsed();
-        timer.add(dt, 1);
         ctx.step += 1;
         num_not_pruned_node += static_ctx.pubtree.len();
+        bar.inc(1);
         if ctx.cfg.record_step.contains(&step) {
+            let message = format!(
+                "Step {} | ETA: {:?} | Progress: {}/{}",
+                step + 1,
+                format_duration(bar.eta()),
+                step + 1,
+                ctx.cfg.epoch
+            );
+            println!("{}", message);
+            if step > WARMUP {
+                let dt = t0.elapsed();
+                timer.add(dt, (step - start_step) as u64);
+            }
             for player in 0..num_player {
                 m.insert(
                     format!("current_return_{}", player),
@@ -982,6 +1018,8 @@ pub fn cfr(game_name: &str, mut logger: Logger, cfg: crate::Config) {
             num_not_pruned_node = 0;
             pp_prune = [0, 0];
             total_num_game_states = 0;
+            t0 = Instant::now();
+            start_step = step;
         }
     }
 }

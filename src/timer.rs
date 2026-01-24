@@ -5,6 +5,16 @@ use std::io::{BufWriter, Write};
 use std::time::Duration;
 use std::time::Instant;
 
+pub fn format_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs(); // 获取总秒数
+    let hours = total_seconds / 3600; // 计算小时数
+    let minutes = (total_seconds % 3600) / 60; // 计算分钟数
+    let seconds = total_seconds % 60; // 计算剩余的秒数
+
+    // 返回格式化的字符串
+    format!("{} hours, {} minutes, {} seconds", hours, minutes, seconds)
+}
+
 /// 在线均值 (Welford)
 #[derive(Default, Debug)]
 pub struct OnlineMean {
@@ -21,6 +31,10 @@ impl OnlineMean {
     }
     pub fn mean(&self) -> f64 {
         self.mean
+    }
+    pub fn clear(&mut self) {
+        self.n = 0;
+        self.mean = 0.0;
     }
 }
 
@@ -60,7 +74,9 @@ impl CfrTimerWithSamples {
         let per_iter_ms = per_iter_secs * 1000.0;
 
         // 在线均值（按“每次迭代”的耗时）
-        self.avg.add(per_iter_ms);
+        for _ in 0..iterations {
+            self.avg.add(per_iter_ms);
+        }
 
         // reservoir：保存“每次迭代”样本（毫秒）
         self.seen += 1;
@@ -112,6 +128,11 @@ impl CfrTimerWithSamples {
             writeln!(w, "{x}")?;
         }
         w.flush()
+    }
+
+    pub fn clear(&mut self) {
+        self.avg.clear();
+        self.samples_ms.clear();
     }
 }
 

@@ -1,5 +1,6 @@
 use chrono::Local;
 use csv::Writer;
+use regex::Regex;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
@@ -26,9 +27,22 @@ impl Logger {
     ) -> std::io::Result<Self> {
         // 目录： ./experiments/<exp_name>/<YYYY-MM-DD>/
         let date = Local::now().format("%Y-%m-%d").to_string();
-        let run_dir = base_dir.as_ref().join(exp_name).join(date);
+        let run_dir = base_dir.as_ref().join(exp_name);
         fs::create_dir_all(&run_dir)?;
-
+        let re = Regex::new(r"_exp-(\d{3})").unwrap();
+        let max_idx = fs::read_dir(&run_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                re.captures(&name)
+                    .and_then(|cap| cap[1].parse::<usize>().ok())
+            })
+            .max()
+            .unwrap_or(0);
+        let idx = max_idx + 1;
+        let run_dir = run_dir.join(format!("{}_exp-{idx:03}", date));
+        fs::create_dir_all(&run_dir)?;
         // 写 purpose.txt
         {
             let mut f = File::create(run_dir.join("purpose.txt"))?;
