@@ -272,6 +272,7 @@ impl UtilityTree {
         rp_2alpha * rp_alpha2
     }
 
+    // 获得compensate状态下的外部到达概率
     pub fn get_rp_outside_compensate(&self, current_player: usize, idx: usize) -> f64 {
         let root_of_pruned_subgame = self.inner[idx].alpha_history_idx.unwrap();
         let rp_2alpha = self.inner[root_of_pruned_subgame]
@@ -279,18 +280,6 @@ impl UtilityTree {
             .as_ref()
             .unwrap();
         let rp_alpha2 = self.inner[idx].rp_alpha2h_on_prune.as_ref().unwrap();
-        // dbg!(rp_2alpha, rp_alpha2);
-        // rp_alpha2
-        //     .iter()
-        //     .zip(rp_2alpha.iter())
-        //     .enumerate()
-        //     .fold(1.0, |product, (player, rp)| {
-        //         if player != current_player {
-        //             product * rp.0 * rp.1
-        //         } else {
-        //             product
-        //         }
-        //     })
         let mut product = 1.0;
         // [0, current_player)
         for i in 0..current_player {
